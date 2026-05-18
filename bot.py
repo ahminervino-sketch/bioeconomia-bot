@@ -1,6 +1,7 @@
 """
 Bioeconomia Bot — PubMed → Bluesky
 Busca papers recentes sobre bioeconomia no PubMed e posta no Bluesky com card de preview.
+DOI incluído no texto para rastreamento pelo Altmetric.
 """
 
 import os
@@ -17,7 +18,6 @@ from atproto import Client, models
 
 BLUESKY_HANDLE = "bioeconomia.bsky.social"
 
-# Termos amazônicos têm prioridade, globais complementam
 SEARCH_TERMS_AMAZON = [
     "Amazon bioeconomy[Title/Abstract]",
     "bioeconomy Brazil[Title/Abstract]",
@@ -92,7 +92,6 @@ def fetch_paper_summary(pmid):
     return r.json().get("result", {}).get(pmid, {})
 
 def get_doi_abstract_and_url(pmid):
-    """Extrai DOI, abstract e tenta obter URL direta do periódico."""
     params = {
         "db": "pubmed",
         "id": pmid,
@@ -104,38 +103,29 @@ def get_doi_abstract_and_url(pmid):
     r = requests.get(PUBMED_FETCH, params=params, timeout=15)
     r.raise_for_status()
 
-    # DOI
     doi_match = re.search(r'<ArticleId IdType="doi">(.*?)</ArticleId>', r.text)
     doi = doi_match.group(1).strip() if doi_match else None
 
-    # Abstract
     abstract_match = re.search(r'<AbstractText[^>]*>(.*?)</AbstractText>', r.text, re.DOTALL)
     abstract = re.sub(r'<[^>]+>', '', abstract_match.group(1)).strip() if abstract_match else ""
     if len(abstract) > 200:
         abstract = abstract[:197] + "..."
 
-    # URL direta: segue o redirecionamento do DOI para obter link do periódico
     direct_url = None
     if doi:
         try:
             doi_url = f"https://doi.org/{doi}"
             resp = requests.get(doi_url, timeout=10, allow_redirects=True)
             direct_url = resp.url
-            # Se caiu em doi.org ou unpaywall, usa o DOI mesmo
             if "doi.org" in direct_url:
                 direct_url = None
         except Exception:
             direct_url = None
 
-    # URL final: direta se conseguiu, senão DOI, senão PubMed
-    if direct_url:
-        link = direct_url
-    elif doi:
-        link = f"https://doi.org/{doi}"
-    else:
-        link = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+    card_url = direct_url if direct_url else (f"https://doi.org/{doi}" if doi else f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/")
+    doi_url  = f"https://doi.org/{doi}" if doi else f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
 
-    return doi, abstract, link
+    return doi, abstract, card_url, doi_url
 
 # ── Controle de IDs já postados ────────────────────────────────────────────────
 
@@ -149,29 +139,28 @@ def save_posted(posted: set):
     with open(POSTED_FILE, "w") as f:
         json.dump(list(posted), f)
 
-# ── Postagem com card embed ────────────────────────────────────────────────────
+# ── Postagem com card embed + DOI no texto ─────────────────────────────────────
 
-def post_with_card(client, title, journal, abstract, link):
-    """Posta no Bluesky com card de preview usando link direto do periódico."""
-
-    text = f"{title}\n\n📰 {journal}\n\n{HASHTAGS}"
+def post_with_card(client, title, journal, abstract, card_url, doi_url):
+    text = f"{title}\n\n📰 {journal}\n\n{HASHTAGS}\n\n🔗 {doi_url}"
 
     if len(text) > 300:
-        max_title = 300 - len(f"\n\n📰 {journal}\n\n{HASHTAGS}") - 1
-        text = f"{title[:max_title]}…\n\n📰 {journal}\n\n{HASHTAGS}"
+        overhead = len(f"\n\n📰 {journal}\n\n{HASHTAGS}\n\n🔗 {doi_url}") + 1
+        max_title = 300 - overhead
+        text = f"{title[:max_title]}…\n\n📰 {journal}\n\n{HASHTAGS}\n\n🔗 {doi_url}"
 
     card_description = abstract if abstract else f"Published in {journal}"
 
     embed = models.AppBskyEmbedExternal.Main(
         external=models.AppBskyEmbedExternal.External(
-            uri=link,
+            uri=card_url,
             title=title[:300],
             description=card_description,
         )
     )
 
     client.send_post(text=text, embed=embed)
-    print(f"[Bot] Postado: {link}")
+    print(f"[Bot] Postado: {doi_url}")
 
 # ── Loop principal ─────────────────────────────────────────────────────────────
 
@@ -180,12 +169,10 @@ def run():
 
     posted = load_posted()
 
-    # Busca primeiro amazônico, depois global para complementar
     amazon_ids = search_pubmed(SEARCH_TERMS_AMAZON, days_back=DAYS_LOOKBACK)
     global_ids = search_pubmed(SEARCH_TERMS_GLOBAL, days_back=DAYS_LOOKBACK)
 
-    # Amazônico tem prioridade, global complementa sem repetir
-    all_ids = list(dict.fromkeys(amazon_ids + global_ids))
+    all_ids   = list(dict.fromkeys(amazon_ids + global_ids))
     new_pmids = [p for p in all_ids if p not in posted]
 
     print(f"[Bot] {len(amazon_ids)} amazônicos + {len(global_ids)} globais = {len(new_pmids)} novos.")
@@ -194,12 +181,9 @@ def run():
         print("[Bot] Nada novo. Encerrando.")
         return
 
-    # Prioriza amazônicos na seleção
     amazon_new = [p for p in new_pmids if p in amazon_ids]
     global_new = [p for p in new_pmids if p not in amazon_ids]
-
-    priority = amazon_new + global_new
-    to_post = priority[:POSTS_PER_RUN]
+    to_post    = (amazon_new + global_new)[:POSTS_PER_RUN]
 
     client = get_bluesky_client()
 
@@ -213,8 +197,8 @@ def run():
                 print(f"[Bot] PMID {pmid} sem título, pulando.")
                 continue
 
-            doi, abstract, link = get_doi_abstract_and_url(pmid)
-            post_with_card(client, title, journal, abstract, link)
+            doi, abstract, card_url, doi_url = get_doi_abstract_and_url(pmid)
+            post_with_card(client, title, journal, abstract, card_url, doi_url)
 
             posted.add(pmid)
             save_posted(posted)
