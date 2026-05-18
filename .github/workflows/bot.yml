@@ -1,0 +1,45 @@
+name: Bioeconomia Bluesky Bot
+
+on:
+  schedule:
+    - cron: "0 11 * * *"   # 08:00 Brasília
+    - cron: "0 15 * * *"   # 12:00 Brasília
+    - cron: "0 21 * * *"   # 18:00 Brasília
+  workflow_dispatch:
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: pip install atproto requests
+
+      - name: Restaurar IDs já postados
+        uses: actions/cache@v4
+        with:
+          path: posted_ids.json
+          key: posted-ids-${{ github.run_id }}
+          restore-keys: |
+            posted-ids-
+
+      - name: Rodar o bot
+        env:
+          BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
+          CONTACT_EMAIL:     ${{ secrets.CONTACT_EMAIL }}
+        run: python bot.py
+
+      - name: Salvar IDs atualizados
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: posted_ids.json
+          key: posted-ids-${{ github.run_id }}
